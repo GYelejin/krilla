@@ -523,6 +523,15 @@ impl ContentBuilder {
         self.graphics_states.restore_state();
     }
 
+    fn is_space_glyph(g: &impl Glyph, text: &str) -> bool {
+        let range = g.text_range();
+        if let Some(slice) = text.get(range) {
+            !slice.is_empty() && slice.chars().all(|c| c == ' ' || c == '\u{00A0}')
+        } else {
+            false
+        }
+    }
+
     /// Encode a successive sequence of glyphs that share the same properties and
     /// can be encoded with one text showing operator.
     #[allow(clippy::too_many_arguments)]
@@ -539,6 +548,13 @@ impl ContentBuilder {
         glyphs: &[impl Glyph],
         text: &str,
     ) {
+        if glyphs.iter().all(|g| Self::is_space_glyph(g, text)) {
+            for glyph in glyphs {
+                *cur_x += glyph.x_advance(size);
+            }
+            return;
+        }
+
         let font_name = self
             .rd_builder
             .register_resource(sc.register_font_identifier(font_identifier));
@@ -548,6 +564,9 @@ impl ContentBuilder {
         );
 
         for glyph in glyphs {
+            if Self::is_space_glyph(glyph, text) {
+                continue;
+            }
             if glyph.glyph_id() == GlyphId::new(0)
                 || pdf_font.font().postscript_name() == Some("LastResort")
             {
@@ -564,6 +583,10 @@ impl ContentBuilder {
         // Acrobat's copy-paste is a bit buggy if `/ActualText` is used at the end of a line, but
         // only if `TJ` is used. With `Tj`, it's fine.
         if let [glyph] = glyphs {
+            if Self::is_space_glyph(glyph, text) {
+                *cur_x += glyph.x_advance(size);
+                return;
+            }
             if approx_eq!(f32, glyph.x_offset(1.0), 0.0, epsilon = 0.001) {
                 self.encode_single_glyph(cur_x, pdf_font, size, context_color, glyph);
                 return;
@@ -576,6 +599,7 @@ impl ContentBuilder {
             size,
             context_color,
             glyphs,
+            text,
         );
     }
 
@@ -604,6 +628,7 @@ impl ContentBuilder {
         size: f32,
         context_color: rgb::Color,
         glyphs: &[impl Glyph],
+        text: &str,
     ) {
         self.scratch.clear();
         let encoded = &mut self.scratch;
@@ -613,11 +638,33 @@ impl ContentBuilder {
         let mut items = positioned.items();
 
         for glyph in glyphs {
+            let is_space = {
+                let range = glyph.text_range();
+                if let Some(slice) = text.get(range) {
+                    !slice.is_empty() && slice.chars().all(|c| c == ' ' || c == '\u{00A0}')
+                } else {
+                    false
+                }
+            };
+
+            let scale = |val| val * pdf_font.units_per_em();
+
+            if is_space {
+                if !encoded.is_empty() {
+                    items.show(Str(encoded));
+                    encoded.clear();
+                }
+
+                let x_advance = scale(glyph.x_advance(1.0));
+                let x_offset = scale(glyph.x_offset(1.0));
+                adjustment += x_offset + x_advance;
+                *cur_x += glyph.x_advance(size);
+                continue;
+            }
+
             let pdf_glyph = pdf_font
                 .get_gid(ColoredGlyph::new(glyph.glyph_id(), context_color))
                 .unwrap();
-
-            let scale = |val| val * pdf_font.units_per_em();
 
             let x_advance = scale(glyph.x_advance(1.0));
             let font_advance = pdf_font
